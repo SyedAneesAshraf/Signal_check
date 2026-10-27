@@ -154,7 +154,7 @@ def aggregate_evidence_status(
     confident = [
         assessment
         for assessment in assessments
-        if assessment.signal.score >= minimum_score and assessment.similarity >= 0
+        if _is_usable_assessment(assessment, minimum_score)
     ]
     weighted = [
         (
@@ -172,7 +172,6 @@ def aggregate_evidence_status(
     ]
     if not usable:
         return "insufficient_evidence"
-
     has_support = any(
         assessment.signal.label == "entailment" for assessment, _ in usable
     )
@@ -186,6 +185,25 @@ def aggregate_evidence_status(
     if has_refutation:
         return "refuted"
     return "insufficient_evidence"
+
+
+def _is_usable_assessment(
+    assessment: EvidenceAssessment,
+    minimum_score: float,
+) -> bool:
+    """Require stronger alignment before treating generic context as refutation."""
+    if assessment.signal.score < minimum_score or assessment.similarity < 0:
+        return False
+    if assessment.signal.label != "contradiction":
+        return True
+    premise = assessment.signal.premise.lower()
+    explicit_negation = re.search(
+        r"\b(?:not|n't|false|incorrect|debunk(?:ed)?|myth|no evidence)\b",
+        premise,
+    )
+    if explicit_negation:
+        return True
+    return assessment.signal.score >= 0.9 and assessment.similarity >= 0.8
 
 
 def _source_quality_weight(source_quality: str) -> float:

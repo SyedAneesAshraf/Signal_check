@@ -14,3 +14,4 @@ def test_health_check() -> None:
     assert body["index_loaded"] == "false"
     assert body["embedding_model_loaded"] == "false"
     assert body["nli_model_loaded"] == "false"
+    assert body["analysis_ready"] == "false"

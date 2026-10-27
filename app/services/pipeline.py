@@ -6,7 +6,8 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
-from app.services.claim_extractor import ExtractedClaim, extract_claims
+from app.services.claim_extractor import ExtractedClaim
+from app.services.claim_service import ClaimSource, extract_factual_claims
 from app.services.evidence_provider import EvidenceProvider
 from app.services.verifier import (
     EvidenceAssessment,
@@ -69,9 +70,7 @@ class TextAnalysisPipeline:
 
     def analyze(self, text: str) -> tuple[list[PipelineClaim], str]:
         logger.info("text_analysis_started input_length=%d", len(text))
-        claims = [
-            claim for claim in extract_claims(text) if claim.claim_type == "factual"
-        ]
+        claims = extract_factual_claims(ClaimSource(input_id="text", text=text))
         logger.info(
             "claim_extraction_completed factual_claims=%d claims=%s",
             len(claims),
@@ -198,22 +197,23 @@ def build_default_pipeline(
     evidence_provider: str = "live",
 ) -> TextAnalysisPipeline:
     from app.services.evidence_provider import (
-        LiveNewsEvidenceProvider,
+        HybridEvidenceProvider,
         LocalEvidenceProvider,
         TavilyEvidenceProvider,
     )
-    from app.services.retriever import EvidenceIndex, SentenceTransformerEmbedder
     from app.services.verifier import BartNLIModel
 
-    embedder = SentenceTransformerEmbedder()
-    index = EvidenceIndex.load(
-        root / "data/index/evidence.faiss",
-        root / "data/index/metadata.json",
-    )
     if evidence_provider == "local":
+        from app.services.retriever import EvidenceIndex, SentenceTransformerEmbedder
+
+        embedder = SentenceTransformerEmbedder()
+        index = EvidenceIndex.load(
+            root / "data/index/evidence.faiss",
+            root / "data/index/metadata.json",
+        )
         provider: EvidenceProvider = LocalEvidenceProvider(index, embedder)
     elif evidence_provider == "live":
-        provider = LiveNewsEvidenceProvider()
+        provider = HybridEvidenceProvider()
     elif evidence_provider == "tavily":
         try:
             provider = TavilyEvidenceProvider()

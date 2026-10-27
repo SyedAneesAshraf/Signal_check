@@ -48,12 +48,13 @@ class _ArticleTextParser(HTMLParser):
 
 def fetch_url_text(url: str, *, timeout: float = 20.0, max_chars: int = 50_000) -> str:
     """Fetch a public web page and return its title plus readable text."""
-    parsed = urlparse(url)
+    normalized_url = url.strip()
+    parsed = urlparse(normalized_url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise ValueError("url must be an absolute http or https URL.")
     try:
         response = httpx.get(
-            url,
+            normalized_url,
             follow_redirects=True,
             headers={"User-Agent": "SignalCheck/0.1"},
             timeout=timeout,

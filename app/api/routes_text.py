@@ -31,7 +31,11 @@ def get_pipeline() -> TextAnalysisPipeline:
         minimum_similarity=settings.minimum_similarity,
         evidence_provider=settings.evidence_provider,
     )
-    readiness.mark_ready()
+    readiness.mark_ready(
+        index_loaded=settings.evidence_provider == "local",
+        embedding_model_loaded=settings.evidence_provider == "local",
+        nli_model_loaded=True,
+    )
     return pipeline
 
 
@@ -76,7 +80,7 @@ def analyze_url(request: UrlAnalysisRequest) -> TextAnalysisResponse:
         raise HTTPException(status_code=422, detail=str(error)) from error
     except (OSError, RuntimeError) as error:
         readiness.mark_error(str(error))
-        raise HTTPException(status_code=503, detail="URL analysis is unavailable.") from error
+        raise HTTPException(status_code=503, detail=str(error)) from error
     return _build_response("url", extracted_text, claims, overall_status)
 
 
@@ -147,7 +151,7 @@ def _build_response(
                 "Evidence was retrieved from the local corpus."
                 if settings.evidence_provider == "local"
                 else (
-                    "Evidence was retrieved from Google News live search."
+                    "Evidence was retrieved from Wikipedia and Google News live search."
                     if settings.evidence_provider == "live"
                     else "Evidence was retrieved from Tavily live web search."
                 )

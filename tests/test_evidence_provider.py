@@ -3,8 +3,10 @@ import pytest
 from app.services.evidence_provider import (
     LocalEvidenceProvider,
     LiveNewsEvidenceProvider,
+    HybridEvidenceProvider,
     RetrievedEvidence,
     TavilyEvidenceProvider,
+    WikipediaEvidenceProvider,
     _canonical_url,
 )
 
@@ -74,3 +76,52 @@ def test_live_news_provider_surfaces_request_failure(monkeypatch) -> None:
     monkeypatch.setattr("httpx.get", fail)
     with pytest.raises(RuntimeError, match="Live news search failed"):
         LiveNewsEvidenceProvider().search("claim", top_k=1)
+
+
+def test_wikipedia_provider_parses_reference_pages(monkeypatch) -> None:
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "pages": [
+                    {
+                            "id": 123,
+                            "title": "Michael Jackson",
+                            "excerpt": "Michael Jackson died in 2009.",
+                            "key": "Michael_Jackson",
+                    }
+                ]
+            }
+
+    monkeypatch.setattr("httpx.get", lambda *args, **kwargs: Response())
+    result = WikipediaEvidenceProvider().search("Michael Jackson", top_k=1)
+    assert result[0].provider == "wikipedia"
+    assert result[0].source_quality == "reputable"
+    assert result[0].source_type == "encyclopedia_reference"
+
+
+def test_hybrid_provider_skips_optional_tavily_without_key(monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    provider = HybridEvidenceProvider()
+    assert len(provider._providers) == 2
+
+
+def test_hybrid_provider_does_not_retry_failed_wikipedia_queries(monkeypatch) -> None:
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(kwargs.get("params", {}).get("q"))
+        raise RuntimeError("rate limited")
+
+    monkeypatch.setattr(WikipediaEvidenceProvider, "search", fail)
+    monkeypatch.setattr(LiveNewsEvidenceProvider, "search", lambda *args, **kwargs: [])
+    provider = HybridEvidenceProvider(failure_cooldown_seconds=60)
+
+    provider.search("Michael Jackson is still alive", top_k=3)
+    provider.search("Michael Jackson death", top_k=3)
+    provider.search("Michael Jackson alive", top_k=3)
+
+    assert len(calls) == 1

@@ -6,6 +6,7 @@ from email.utils import parsedate_to_datetime
 import logging
 import os
 import re
+import time
 from typing import Any, Protocol
 from urllib.parse import urlsplit, urlunsplit
 from xml.etree import ElementTree
@@ -165,6 +166,173 @@ class LiveNewsEvidenceProvider:
         return results
 
 
+class WikipediaEvidenceProvider:
+    """Search Wikipedia for biographies and historical reference material."""
+
+    endpoint = "https://en.wikipedia.org/w/rest.php/v1/search/page"
+
+    def __init__(self, timeout: float = 20.0) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero.")
+        self._timeout = timeout
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        if not query.strip():
+            raise ValueError("query must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        import httpx
+
+        try:
+            response = httpx.get(
+                self.endpoint,
+                params={
+                    "q": query,
+                    "limit": top_k,
+                },
+                headers={
+                    "User-Agent": (
+                        "MultimodalEvidenceResearch/0.1 "
+                        "(contact: research@example.com)"
+                    )
+                },
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            payload: Any = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            logger.warning(
+                "evidence_search_failed provider=wikipedia query=%r error=%s",
+                query,
+                type(error).__name__,
+            )
+            raise RuntimeError("Wikipedia search failed.") from error
+
+        pages = payload.get("pages", []) if isinstance(payload, dict) else []
+        if not isinstance(pages, list):
+            raise RuntimeError("Wikipedia search returned an invalid response.")
+
+        results: list[RetrievedEvidence] = []
+        for index, page in enumerate(pages):
+            if not isinstance(page, dict):
+                continue
+            title = page.get("title")
+            passage = page.get("excerpt")
+            key = page.get("key")
+            url = f"https://en.wikipedia.org/wiki/{key}" if isinstance(key, str) else None
+            if not all(
+                isinstance(value, str) and value.strip()
+                for value in (title, passage, url)
+            ):
+                continue
+            results.append(
+                RetrievedEvidence(
+                    passage_id=f"wikipedia_{page.get('id', index + 1)}",
+                    title=title,
+                    source_name="Wikipedia",
+                    source_url=url,
+                    published_date=None,
+                    passage=passage,
+                    retrieval_similarity=_query_similarity(query, title, passage),
+                    source_type="encyclopedia_reference",
+                    source_quality="reputable",
+                    retrieved_date=date.today().isoformat(),
+                    provider="wikipedia",
+                    source_quality_weight=_source_quality_weight("reputable"),
+                    domain="wikipedia.org",
+                )
+            )
+        return results
+
+
+class HybridEvidenceProvider:
+    """Combine reference, current-news, and optional general-web evidence."""
+
+    def __init__(
+        self,
+        *,
+        timeout: float = 20.0,
+        include_tavily: bool | None = None,
+        failure_cooldown_seconds: float = 60.0,
+    ) -> None:
+        if failure_cooldown_seconds < 0:
+            raise ValueError("failure_cooldown_seconds must not be negative.")
+        self._providers: list[EvidenceProvider] = [
+            WikipediaEvidenceProvider(timeout=timeout),
+            LiveNewsEvidenceProvider(),
+        ]
+        self._reference_cache: dict[str, list[RetrievedEvidence]] = {}
+        self._reference_failures: dict[str, float] = {}
+        self._failure_cooldown_seconds = failure_cooldown_seconds
+        tavily_key_configured = bool(os.getenv("TAVILY_API_KEY"))
+        if include_tavily is True or (include_tavily is None and tavily_key_configured):
+            self._providers.append(TavilyEvidenceProvider(timeout=timeout))
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        results: list[RetrievedEvidence] = []
+        seen_urls: set[str] = set()
+        for provider in self._providers:
+            try:
+                if isinstance(provider, WikipediaEvidenceProvider):
+                    cache_key = _reference_query_key(query)
+                    provider_results = self._reference_cache.get(cache_key)
+                    failed_at = self._reference_failures.get(cache_key)
+                    failure_is_recent = (
+                        failed_at is not None
+                        and time.monotonic() - failed_at < self._failure_cooldown_seconds
+                    )
+                    if provider_results is None and not failure_is_recent:
+                        try:
+                            provider_results = provider.search(query, top_k=top_k)
+                        except RuntimeError:
+                            self._reference_failures[cache_key] = time.monotonic()
+                            logger.warning(
+                                "hybrid_provider_source_failed source=WikipediaEvidenceProvider "
+                                "query_key=%r cooldown_seconds=%.0f",
+                                cache_key,
+                                self._failure_cooldown_seconds,
+                            )
+                            provider_results = []
+                        else:
+                            self._reference_cache[cache_key] = provider_results
+                    elif failure_is_recent:
+                        logger.info(
+                            "hybrid_provider_source_skipped source=WikipediaEvidenceProvider "
+                            "query_key=%r reason=recent_failure",
+                            cache_key,
+                        )
+                        provider_results = []
+                    if provider_results is None:
+                        provider_results = provider.search(query, top_k=top_k)
+                        self._reference_cache[cache_key] = provider_results
+                else:
+                    provider_results = provider.search(query, top_k=top_k)
+            except RuntimeError:
+                logger.warning(
+                    "hybrid_provider_source_failed source=%s",
+                    type(provider).__name__,
+                    exc_info=True,
+                )
+                continue
+            for item in provider_results:
+                key = _canonical_url(item.source_url) or (
+                    f"{item.source_name}:{item.title}".lower()
+                )
+                if key in seen_urls:
+                    continue
+                seen_urls.add(key)
+                results.append(item)
+        return sorted(
+            results,
+            key=lambda item: (
+                item.retrieval_similarity * item.source_quality_weight,
+                item.source_quality_weight,
+            ),
+            reverse=True,
+        )[:top_k]
+
+
 class TavilyEvidenceProvider:
     """Search Tavily results; requires TAVILY_API_KEY and never silently falls back."""
 
@@ -280,11 +448,27 @@ def _query_similarity(query: str, title: str, passage: str) -> float:
     return min(0.95, max(0.3, overlap))
 
 
+def _reference_query_key(query: str) -> str:
+    words = re.findall(r"[a-z0-9]+", query.lower())
+    return " ".join(
+        word
+        for word in words
+        if word not in {"is", "was", "are", "were", "still", "alive", "dead", "died", "death"}
+    )
+
+
 def _live_source_quality(url: str) -> str:
     hostname = _hostname(url)
-    if hostname.endswith((".gov", ".edu")):
+    if hostname.endswith((".gov", ".edu")) or hostname.endswith(".wikipedia.org"):
         return "official"
-    if hostname in {"reuters.com", "apnews.com", "bbc.com", "npr.org"}:
+    if hostname in {
+        "reuters.com",
+        "apnews.com",
+        "bbc.com",
+        "npr.org",
+        "theguardian.com",
+        "nytimes.com",
+    }:
         return "reputable"
     return "unknown"
 
@@ -292,7 +476,11 @@ def _live_source_quality(url: str) -> str:
 def _quality_from_source_type(source_type: str) -> str:
     if source_type.startswith("official_"):
         return "official"
-    if source_type in {"reputable_news", "academic_reference"}:
+    if source_type in {
+        "reputable_news",
+        "academic_reference",
+        "encyclopedia_reference",
+    }:
         return "reputable"
     if source_type == "scope_note":
         return "context_only"

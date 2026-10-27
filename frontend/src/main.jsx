@@ -25,6 +25,7 @@ function App() {
   const [textState, setTextState] = useState({ loading: false, error: "", result: null });
   const [urlState, setUrlState] = useState({ loading: false, error: "", result: null });
   const [imageState, setImageState] = useState({ loading: false, error: "", result: null });
+  const [caseState, setCaseState] = useState({ loading: false, error: "", result: null });
 
   async function submit(kind, endpoint, options) {
     const setters = { text: setTextState, url: setUrlState, image: setImageState };
@@ -39,7 +40,7 @@ function App() {
       setState({
         loading: false,
         result: null,
-        error: `${requestError.message} Check that the API is running on ${API_URL}.`,
+        error: requestError.message,
       });
     }
   }
@@ -70,6 +71,52 @@ function App() {
     const formData = new FormData();
     formData.append("file", image);
     return submit("image", "/api/analyze/image", { method: "POST", body: formData });
+  }
+
+  async function analyzeCase() {
+    if (caseState.loading || (!text.trim() && !url.trim() && !image)) return;
+    setCaseState({ loading: true, error: "", result: null });
+    try {
+      const created = await fetch(`${API_URL}/api/cases`, { method: "POST" });
+      const createdPayload = await created.json();
+      if (!created.ok) throw new Error(createdPayload.detail || "Could not create case.");
+      const caseId = createdPayload.case_id;
+      if (text.trim()) {
+        await addCaseInput(caseId, "/inputs/text", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: text.trim() }),
+        });
+      }
+      if (url.trim()) {
+        await addCaseInput(caseId, "/inputs/url", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: url.trim() }),
+        });
+      }
+      if (image) {
+        const formData = new FormData();
+        formData.append("file", image);
+        await addCaseInput(caseId, "/inputs/image", { method: "POST", body: formData });
+      }
+      const response = await fetch(`${API_URL}/api/cases/${caseId}/analyze`, { method: "POST" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Case analysis failed.");
+      setCaseState({ loading: false, error: "", result: payload });
+    } catch (requestError) {
+      setCaseState({
+        loading: false,
+        result: null,
+        error: requestError.message,
+      });
+    }
+  }
+
+  async function addCaseInput(caseId, suffix, options) {
+    const response = await fetch(`${API_URL}/api/cases/${caseId}${suffix}`, options);
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.detail || "Could not add case input.");
   }
 
   return (
@@ -123,6 +170,14 @@ function App() {
             <ResultPanel state={imageState} />
           </Workspace>
         </section>
+        <section className="mt-8 rounded-2xl border border-slate-200 bg-white p-6 shadow-[0_18px_50px_rgba(29,48,82,.07)]">
+          <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <div><p className="font-mono text-[10px] uppercase tracking-[.16em] text-coral">Manual case</p><h2 className="mt-1 font-display text-2xl font-bold">Combine related inputs</h2><p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">Submit the text, URL, and image above as one case to detect shared signals and produce a combined genuine/deceptive result.</p></div>
+            <button type="button" onClick={analyzeCase} disabled={caseState.loading || (!text.trim() && !url.trim() && !image)} className="flex shrink-0 items-center justify-center gap-2 rounded-xl bg-coral px-5 py-3 text-sm font-semibold text-white transition hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-40">{caseState.loading ? <LoaderCircle className="animate-spin" size={17} /> : <ShieldCheck size={17} />} {caseState.loading ? "Analyzing case..." : "Analyze combined case"}</button>
+          </div>
+          {caseState.error && <div className="mt-5 rounded-xl border border-red-100 bg-red-50 p-4 text-xs leading-5 text-red-700">{caseState.error}</div>}
+          {caseState.result && <div className={`mt-5 rounded-xl border p-5 ${caseState.result.verdict === "deceptive" ? "border-red-200 bg-red-50 text-red-800" : caseState.result.verdict === "needs_review" ? "border-amber-200 bg-amber-50 text-amber-800" : "border-emerald-200 bg-emerald-50 text-emerald-800"}`}><p className="font-mono text-[10px] uppercase tracking-[.14em]">Combined assessment</p><p className="mt-2 font-display text-3xl font-bold">{caseState.result.verdict === "deceptive" ? "High deception risk" : caseState.result.verdict === "needs_review" ? "Needs review" : "Low deception risk"}</p><div className="mt-4 grid gap-3 text-sm sm:grid-cols-3"><div className="rounded-lg bg-white/60 p-3"><p className="text-[10px] uppercase tracking-[.1em] opacity-60">Content status</p><p className="mt-1 font-semibold">{caseState.result.content_assessment || "not assessed"}</p></div><div className="rounded-lg bg-white/60 p-3"><p className="text-[10px] uppercase tracking-[.1em] opacity-60">Trust risk</p><p className="mt-1 font-semibold">{caseState.result.deception_risk || "unknown"}</p></div><div className="rounded-lg bg-white/60 p-3"><p className="text-[10px] uppercase tracking-[.1em] opacity-60">Sender intent</p><p className="mt-1 font-semibold">Not determinable</p></div></div><p className="mt-3 text-sm">Prototype risk score: {Math.round((caseState.result.risk_score || 0) * 100)}% · {caseState.result.inputs.length} input{caseState.result.inputs.length === 1 ? "" : "s"} · {caseState.result.claims.length} claim{caseState.result.claims.length === 1 ? "" : "s"} analyzed</p>{caseState.result.decision_basis && <p className="mt-3 text-sm leading-6">{caseState.result.decision_basis}</p>}{caseState.result.recommended_action && <p className="mt-3 rounded-lg bg-white/60 p-3 text-xs leading-5"><strong>Recommended action:</strong> {caseState.result.recommended_action}</p>}{caseState.result.ai_investigation?.status === "unavailable" && <p className="mt-3 text-xs">AI investigator unavailable; showing the baseline evidence and signal analysis.</p>}{caseState.result.ai_investigation?.summary && <div className="mt-4 border-t border-current/10 pt-4 text-sm"><p className="font-semibold">AI investigator</p><p className="mt-1 leading-6">{caseState.result.ai_investigation.summary}</p>{caseState.result.ai_investigation.reasons?.length > 0 && <ul className="mt-2 list-disc space-y-1 pl-5">{caseState.result.ai_investigation.reasons.map((reason) => <li key={reason}>{reason}</li>)}</ul>}</div>}{caseState.result.limitations?.length > 0 && <details className="mt-4 border-t border-current/10 pt-3 text-xs"><summary className="cursor-pointer font-semibold">Limitations</summary><ul className="mt-2 list-disc space-y-1 pl-5">{caseState.result.limitations.map((item) => <li key={item}>{item}</li>)}</ul></details>}</div>}
+        </section>
       </main>
       <footer className="border-t border-slate-200 bg-white px-5 py-8 text-center font-mono text-[11px] text-slate-400">SignalCheck uses retrieval, pretrained models, and source-linked evidence. Results are signals for review, not absolute truth.</footer>
     </div>
@@ -157,7 +212,7 @@ function ResultPanel({ state }) {
     <div className="rounded-xl border border-coral/20 bg-orange-50/60 p-4"><p className="font-mono text-[10px] uppercase tracking-[.14em] text-coral">Extracted claim</p><p className="mt-2 text-sm font-semibold leading-6 text-slate-700">{claim.claim_text}</p></div>
     <div className="rounded-xl border border-slate-200 bg-slate-50 p-4"><div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[.14em] text-coral"><Sparkles size={14} /> Personalized analysis</div><p className="mt-2 text-sm leading-6 text-slate-600">{claim.analysis}</p></div>
     <p className="font-mono text-[10px] uppercase tracking-[.12em] text-slate-400">{claim.evidence.length} source{claim.evidence.length === 1 ? "" : "s"} matched</p>
-    {claim.evidence.map((item, index) => <div key={item.passage_id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between gap-2 text-[10px] text-slate-400"><span>0{index + 1} · {item.source_name}</span><span>{Math.round(item.nli_score * 100)}% {item.nli_label}</span></div><p className="mt-2 text-sm font-semibold leading-5 text-slate-700">{item.title}</p><button type="button" onClick={() => setExpanded(expanded === item.passage_id ? null : item.passage_id)} className="mt-3 flex items-center gap-1 text-xs font-semibold text-coral">{expanded === item.passage_id ? "Hide evidence" : "Read evidence"} <ChevronDown className={expanded === item.passage_id ? "rotate-180" : ""} size={14} /></button>{expanded === item.passage_id && <div className="mt-3 border-t border-slate-100 pt-3 text-xs leading-5 text-slate-500"><p>{item.passage}</p>{item.source_url && <a className="mt-2 inline-flex items-center gap-1 font-semibold text-coral" href={item.source_url} target="_blank" rel="noreferrer">Open source <ArrowUpRight size={13} /></a>}</div>}</div>)}
+    {claim.evidence.map((item, index) => <div key={item.passage_id} className="rounded-xl border border-slate-200 p-4"><div className="flex items-center justify-between gap-2 text-[10px] text-slate-400"><span>0{index + 1} · {item.source_name}</span><span>{Math.round(item.nli_score * 100)}% {item.nli_label}</span></div><p className="mt-2 text-sm font-semibold leading-5 text-slate-700">{item.title}</p><p className="mt-1 text-[10px] uppercase tracking-[.1em] text-slate-400">{item.source_quality || "unclassified source"} · {item.provider || "unknown provider"}</p><button type="button" onClick={() => setExpanded(expanded === item.passage_id ? null : item.passage_id)} className="mt-3 flex items-center gap-1 text-xs font-semibold text-coral">{expanded === item.passage_id ? "Hide evidence" : "Read evidence"} <ChevronDown className={expanded === item.passage_id ? "rotate-180" : ""} size={14} /></button>{expanded === item.passage_id && <div className="mt-3 border-t border-slate-100 pt-3 text-xs leading-5 text-slate-500"><p>{item.passage}</p>{item.source_url && <a className="mt-2 inline-flex items-center gap-1 font-semibold text-coral" href={item.source_url} target="_blank" rel="noreferrer">Open source <ArrowUpRight size={13} /></a>}</div>}</div>)}
   </div>;
 }
 

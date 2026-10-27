@@ -1,231 +1,217 @@
-# A Multimodal Fusion Framework for Evidence-Based Cross-Channel Deception Verification
+# SignalCheck
 
-Initial review prototype for evidence-grounded deception verification.
+SignalCheck is a research prototype for **multimodal content-risk and
+evidence verification**. It accepts manually supplied text, public URLs, and
+images/screenshots, retrieves relevant evidence, checks factual claims, looks
+for phishing indicators, compares related inputs, and reports when the
+evidence is insufficient.
 
-## Phase 1
+It does **not** prove that a person intentionally lied. The system evaluates
+the content and the risk of trusting it; sender intent is explicitly reported
+as not determinable from content alone.
 
-Phase 1 provides the FastAPI project foundation and a health endpoint. The
-retrieval index, claim extraction, and NLI verification are added in later
-phases.
+## What it can do
 
-## Phase 2
+- Extract factual claims from text, webpages, and OCR output.
+- Search live Wikipedia and Google News evidence by default.
+- Use optional Tavily web search when configured.
+- Compare claims with retrieved passages using semantic relevance and BART NLI.
+- Preserve source provenance, quality, provider, domain, and retrieval dates.
+- Detect baseline phishing indicators in URLs and related messages.
+- Correlate related inputs through shared URLs, entities, and similar wording.
+- OCR uploaded screenshots with `microsoft/trocr-base-printed`.
+- Analyze combined text, URL, and image cases.
+- Return `deceptive`, `genuine`, or `needs_review` as a content-risk decision.
+- Separate:
+  - `content_assessment`: `supported`, `refuted`, or `insufficient_evidence`
+  - `deception_risk`: `low`, `high`, or `unknown`
+  - `intent_assessment`: currently `not_determinable_from_content`
 
-Phase 2 adds a small, multi-domain local evidence corpus in
-`data/evidence/documents.json`. Each document includes source provenance,
-retrieval date, and trust notes. The corpus loader validates the metadata and
-the passage splitter preserves that metadata for every generated passage.
+## What it cannot do yet
 
-The corpus is intentionally limited to controlled examples for the prototype,
-covering public health, consumer fraud, employment scams, cybersecurity,
-climate science, public safety, and an insufficient-evidence scope note. It is
-not a live web-search index.
+- Prove sender intent or maliciousness.
+- Determine whether arbitrary image pixels are authentic.
+- Detect deepfakes or reliably judge unusual scenes such as a flying car.
+- Provide calibrated probabilities from the prototype risk score.
+- Guarantee that live search results are complete or correct.
+- Persist cases after the backend process stops.
+- Transcribe audio automatically; audio currently needs a supplied transcript.
 
-## Phase 3
+An image without readable text is deliberately classified as `needs_review`
+unless other evidence establishes a high-risk content decision. This is safer
+than treating a valid image file as proof of authenticity.
 
-Phase 3 adds semantic retrieval with
-`sentence-transformers/all-mpnet-base-v2` and FAISS. Build the persisted index
-with:
-
-```bash
-python -m scripts.build_index
-```
-
-This writes `data/index/evidence.faiss` and `data/index/metadata.json`. The
-metadata order matches FAISS vector IDs exactly. Similarity indicates semantic
-relevance only; it does not establish that a claim is true.
-
-## Phase 4
-
-Phase 4 adds a transparent, domain-independent rule-based claim extractor in
-`app/services/claim_extractor.py`. It splits input into candidate statements,
-extracts basic named entities and URLs, and labels statements conservatively.
-Extraction only structures the input; it does not verify claims or determine
-whether they are true.
-
-## Phase 6
-
-Phase 6 connects extraction, FAISS retrieval, and NLI verification through the
-`POST /api/analyze/text` endpoint. Heavy models are loaded lazily on the first
-analysis request. The response includes claims, source metadata, similarity,
-NLI signals, cautious statuses, and explicit limitations.
-
-## Phase 5
-
-Phase 5 adds NLI-based claim verification with
-`facebook/bart-large-mnli`. Evidence is passed as the premise and the
-extracted claim as the hypothesis. The model's configured labels are
-normalized at runtime, and multiple signals are aggregated conservatively into
-`supported`, `refuted`, `conflicting_evidence`, or `insufficient_evidence`.
-NLI results are model estimates, not proof of truth.
-
-## Phase 8
-
-The pipeline now uses a pluggable `EvidenceProvider` boundary. The live Google
-News provider is the API default; the local provider is available for
-reproducible tests. A Tavily live provider is available when `TAVILY_API_KEY`
-is configured; it fails explicitly when the key is missing and never silently
-substitutes local evidence. No API key is stored in the repository.
-
-To opt into live web retrieval, configure the key in the shell that starts the
-API and explicitly select the provider:
-
-```bash
-export TAVILY_API_KEY="your-key"
-export EVIDENCE_PROVIDER=tavily
-uvicorn app.main:app --reload
-```
-
-The default API provider is now `EVIDENCE_PROVIDER=live`, which searches current
-Google News results without an API key. Use `EVIDENCE_PROVIDER=local` for
-reproducible demonstrations and tests. Tavily remains available as an optional
-provider when `TAVILY_API_KEY` is configured.
-
-## Phase 9
-
-Evidence results preserve source type, source-quality category, retrieval date,
-and canonicalized URLs. Duplicate live results are removed before NLI
-verification. Source quality is an evidence attribute, not a truth decision:
-official sources are marked `official`, known reference categories can be
-`reputable`, and unclassified live results remain `unknown`.
-
-## Phase 10
-
-Verification aggregation now combines NLI confidence, retrieval similarity,
-and source-quality weights. A passage must meet both relevance and weighted
-confidence thresholds before it can support or refute a claim. This reduces
-false verdicts from highly confident NLI predictions on weakly related or
-context-only passages.
-
-## Phase 11
-
-The API now exposes component readiness through `GET /health`, validates
-runtime configuration, and records model/index loading failures. Limits such
-as maximum text length, retrieval `top_k`, and minimum similarity can be
-configured with environment variables:
+## Architecture
 
 ```text
-MAX_TEXT_LENGTH
-TOP_K
-MINIMUM_SIMILARITY
-MODEL_LOAD_TIMEOUT_SECONDS
-EVIDENCE_PROVIDER=local|live|tavily
+Manual inputs
+    |
+    +-- text --------------------+
+    +-- public URL --------------+--> claim extraction
+    +-- screenshot --> OCR ------+    evidence retrieval
+                                      NLI verification
+                                      phishing signals
+                                      cross-input correlation
+                                      prototype decision fusion
+                                      optional Groq investigation
+                                              |
+                                              v
+                       content status + deception risk + limitations
 ```
 
-## Phase 12
+Important backend locations:
 
-The manually reviewed local evaluation set is stored separately from demo
-cases in `data/evaluation/text_cases.json`. It records expected statuses,
-traceable evidence IDs, and review notes. Run the real-model evaluation with:
+- [app/services/pipeline.py](app/services/pipeline.py): claim extraction,
+  retrieval, relevance filtering, NLI, and evidence aggregation.
+- [app/services/evidence_provider.py](app/services/evidence_provider.py):
+  local, Wikipedia, Google News, hybrid, and optional Tavily providers.
+- [app/services/phishing.py](app/services/phishing.py): URL and message risk
+  signals.
+- [app/services/case_analysis.py](app/services/case_analysis.py): combined
+  case orchestration and decision output.
+- [app/services/verifier.py](app/services/verifier.py): cautious evidence
+  aggregation and contradiction filtering.
+- [app/services/image_analysis.py](app/services/image_analysis.py): image
+  metadata and perceptual-hash inspection.
+- [app/services/multimodal.py](app/services/multimodal.py): OCR and public
+  webpage extraction.
 
-```bash
-OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m scripts.evaluate_text
+## Requirements
+
+- Python 3.11 or newer
+- Node.js and npm
+- Internet access for the live evidence provider and optional Groq investigator
+- A Groq API key only if AI investigation is desired
+
+The local FAISS index and model files are generated or downloaded locally.
+They are not required when using the default live provider, although the
+retrieval and NLI models may still be downloaded on first use.
+
+## Windows setup
+
+From the project root:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -e .
 ```
 
-The printed metrics describe only this small controlled set; they are not
-general accuracy claims.
+Install frontend dependencies:
 
-## Text pipeline diagnostics
-
-The backend emits structured stage-count logs at `INFO` level for text
-analysis. They include generated search queries, provider status, raw and
-deduplicated result counts, relevance and similarity filtering, NLI input
-counts, aggregation, and the final status. Start Uvicorn with:
-
-```bash
-uvicorn app.main:app --log-level info
-```
-
-For life-status claims, the text pipeline searches the original claim plus
-small claim-preserving variants such as `"<subject> death"` and
-`"<subject> alive"`. Results mentioning a different person or a non-human
-object are not accepted as direct evidence for the subject's life status.
-
-The evaluation currently contains three manually reviewed cases and reports
-only final-status accuracy and a confusion count. Larger, independently
-annotated data is required before making any general performance claim.
-
-## Phase 7
-
-Phase 7 adds labelled demonstrations in `data/demo_cases.json` covering
-supported, refuted, and insufficient-evidence outcomes. Run them with the
-actual local models using:
-
-```bash
-OMP_NUM_THREADS=1 TOKENIZERS_PARALLELISM=false python -m scripts.run_demo
-```
-
-The demo compares expected labels from the controlled corpus with the actual
-pipeline statuses. These are preliminary demonstrations, not accuracy claims.
-
-## Setup
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements.txt
-python -m pip install -e .
-```
-
-The editable install makes the `app` package importable in the active virtualenv,
-which avoids `ModuleNotFoundError: No module named 'app'` when running the API
-or utility scripts from the project root.
-
-## Run the API
-
-```bash
-uvicorn app.main:app --reload
-```
-
-The API is available at `http://127.0.0.1:8000`.
-
-## Run the interactive frontend
-
-In a second terminal:
-
-```bash
-cd frontend
+```powershell
+Set-Location frontend
 npm install
+Set-Location ..
+```
+
+## Environment configuration
+
+Create a local `.env` file. Never commit it or paste its values into an issue
+or chat:
+
+```text
+EVIDENCE_PROVIDER=live
+GROQ_API_KEY=your-key
+GROQ_MODEL=openai/gpt-oss-20b
+ANALYSIS_TRACE=false
+```
+
+Optional:
+
+```text
+TAVILY_API_KEY=your-key
+EVIDENCE_PROVIDER=tavily
+TOP_K=3
+MINIMUM_SIMILARITY=0.3
+MAX_TEXT_LENGTH=10000
+```
+
+`.env` is ignored by Git. API keys are not required for the deterministic
+text, URL, OCR, and evidence pipeline when Groq is disabled.
+
+## Run the project
+
+Start the backend in one PowerShell terminal:
+
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --reload
+```
+
+Start the frontend in another:
+
+```powershell
+Set-Location frontend
 npm run dev
 ```
 
-Open `http://127.0.0.1:5173`. The frontend sends claims to the FastAPI
-endpoint, displays the verdict, and lets you expand each source to inspect its
-evidence and open the original article. It also displays a concise,
-evidence-grounded natural-language analysis generated from the verification
-model's verdict and the retrieved sources. Set `VITE_API_URL` if the API is
-running on a different host or port.
+Open:
 
-The frontend is built with React, Vite, and Tailwind CSS. Text, URL, and image
-workspaces keep their input, loading, error, and result state independent, so
-you can test each modality without replacing another modality's result.
+- Frontend: [http://localhost:5173](http://localhost:5173)
+- API: [http://127.0.0.1:8000](http://127.0.0.1:8000)
+- Health: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
 
-The UI has independent tabs for:
+The backend API can also be started without reload for a stable manual test:
 
-- **Text claim**: submit a claim directly.
-- **Article URL**: fetch a public HTML page, extract its title/description/body,
-  and verify the extracted factual claims.
-- **Image / screenshot**: upload a clear printed-text image. A lazy-loaded
-  pretrained `microsoft/trocr-base-printed` model extracts the text before it
-  is sent through the same claim, retrieval, and verification pipeline.
-
-Image OCR works best with high-contrast screenshots and large, horizontal text.
-OCR output is model-generated and should be checked in the extracted claim
-shown by the result.
-
-## Health check
-
-```bash
-curl http://127.0.0.1:8000/health
+```powershell
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
 ```
 
-Expected response:
+## Main API routes
 
-```json
-{"status":"ok"}
+### Single-input analysis
+
+- `POST /api/analyze/text`
+- `POST /api/analyze/url`
+- `POST /api/analyze/image`
+
+### Manual combined cases
+
+- `POST /api/cases`
+- `POST /api/cases/{case_id}/inputs/text`
+- `POST /api/cases/{case_id}/inputs/url`
+- `POST /api/cases/{case_id}/inputs/image`
+- `POST /api/cases/{case_id}/inputs/audio`
+- `POST /api/cases/{case_id}/analyze`
+- `GET /api/cases/{case_id}`
+- `DELETE /api/cases/{case_id}`
+
+Uploaded bytes are held in process memory for the prototype and are excluded
+from API responses. They are lost when the backend process stops.
+
+## Interpreting results
+
+`deceptive` means that the content crossed the configured content-risk
+threshold, commonly because of strong phishing or contradiction signals. It
+does not prove intentional deception.
+
+`genuine` means the available evidence did not indicate deception and relevant
+evidence was available. It does not prove that the content is authentic.
+
+`needs_review` means the evidence is missing, weak, conflicting, or the input
+requires visual inspection that the current models cannot perform.
+
+Always inspect the linked evidence and the `limitations` field before taking
+action.
+
+## Development and validation
+
+Run the backend tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest -q
 ```
 
-## Tests
+Build the frontend:
 
-```bash
-pytest
+```powershell
+Set-Location frontend
+npm run build
 ```
+
+The current verified baseline is **78 backend tests passing** and a successful
+frontend production build.
+
+For detailed progress and known limitations, see
+[docs/PROGRESS.md](docs/PROGRESS.md). The implementation roadmap is in
+[docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md).

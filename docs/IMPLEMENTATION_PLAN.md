@@ -1,91 +1,199 @@
-# Multimodal Deception Verification Prototype
+# SignalCheck Implementation Plan
 
 ## Project direction
 
-This project is a research prototype for manually submitted multimodal cases. The near-term objective is to detect phishing and coordinated deception using claim verification, rather than to build a production monitoring platform.
+SignalCheck is a research prototype for manually submitted multimodal cases.
+Its focused objective is to verify claims and identify content-level
+deception risk in suspicious messages, screenshots, and URLs.
 
-The first demonstration will accept related text, image, and URL inputs and return a genuine/deceptive result. Audio will be added by Phase 9. Video and continuous source monitoring remain future work.
+It does not prove that a sender intentionally lied. The system reports whether
+content is supported, refuted, high-risk, or insufficiently evidenced, while
+sender intent remains `not_determinable_from_content`.
 
-## Decisions
+## Current decisions
 
 - **Project type:** Research prototype
-- **Initial workflow:** Manual case submission
-- **Initial modalities:** Text, image, URL
-- **Later modality:** Asynchronous audio by Phase 9
-- **Processing:** Hosted/free APIs may be used behind replaceable provider interfaces; the prototype must retain a controlled offline path where practical
-- **Storage:** Raw uploads are temporary; derived case results may be retained for evaluation
-- **Primary goal:** Coordinated deception detection and phishing detection supported by claim verification
-- **Primary output:** `genuine` or `deceptive`
-- **Evaluation data:** Controlled prototype cases initially
-- **Explainability:** Not a primary research requirement for the first implementation
-- **Deployment direction:** Manual inputs now; continuous multi-source monitoring is future work
+- **Current workflow:** Manual case submission
+- **Primary modalities:** Text, image/screenshot, and URL
+- **Audio:** Transcript-backed asynchronous ingestion exists; hosted speech
+  transcription is deferred
+- **Processing:** Live evidence and optional hosted AI are replaceable; a
+  controlled local evidence path remains available
+- **Storage:** Raw uploads are temporary process-local bytes and are not
+  returned by the API
+- **Primary use case:** Phishing and suspicious-content verification supported
+  by claim evidence
+- **Result model:** Content status, deception risk, abstention, evidence
+  provenance, recommendation, and explicit limitations
+- **Evaluation:** Controlled prototype dataset first; no general accuracy claim
+  from hand-picked examples
+- **Deployment direction:** Manual analysis now; continuous monitoring is
+  deferred
+
+## Completed implementation
+
+- Temporary case creation, retrieval, deletion, and related input ingestion.
+- Text, URL, image, and transcript-backed audio inputs.
+- Live Wikipedia and Google News retrieval.
+- Optional Tavily retrieval.
+- Local FAISS retrieval path for reproducible demonstrations.
+- Claim extraction, source-linked evidence, relevance filtering, and BART NLI.
+- Source quality, provider, domain, publication, and retrieval provenance.
+- URL and message-context phishing signals.
+- Screenshot OCR through TrOCR.
+- Combined text, URL, and image case analysis.
+- Cross-input shared URL, entity, and similarity correlation.
+- Conservative `needs_review` behavior when evidence is absent or weak.
+- Contradiction filtering to avoid treating generic contextual headlines as
+  proof that a claim is false.
+- Separate content status, deception risk, and sender-intent fields.
+- Optional Groq contextual investigation with deterministic fallback.
+- Frontend manual-analysis workflow.
+- Backend regression tests and frontend production build.
 
 ## Phase gates
 
-Every phase must pass its implementation checks before the next phase begins:
+Every phase must:
 
-1. Implement only the phase scope.
+1. Implement only its defined scope.
 2. Add or update focused tests.
-3. Run the relevant backend and frontend checks.
-4. Manually inspect the resulting behavior where applicable.
-5. Record what was verified and any remaining limitations in `docs/PROGRESS.md`.
+3. Run backend tests and the frontend build where applicable.
+4. Manually exercise the changed behavior.
+5. Record verified behavior and limitations in
+   [docs/PROGRESS.md](PROGRESS.md).
 
-## Phases
+## Phase A — Reliable claim verification
 
-### Phase 1 — Manual case workflow
+### Goal
 
-Create a case-oriented workflow that accepts multiple related manual inputs. Support case creation, text/URL/image input ingestion, input metadata, temporary raw content handling, case retrieval, and deletion. Do not claim to produce a fused verdict yet.
+Reduce false refutations and make evidence aggregation defensible.
 
-**Exit criteria**
+### Work
 
-- A case can be created.
-- Text, URL, and image inputs can be added to the same case.
-- Inputs have stable IDs and metadata.
-- Raw image bytes are held temporarily and are not returned by the API.
-- Missing cases and invalid input types fail explicitly.
-- Focused API tests pass.
+- Add claim-type-aware checks for life-status, numerical, date, location,
+  identity, and causal claims.
+- Prefer passages that explicitly state a claim or its negation.
+- Separate article headlines from article body text.
+- Record why evidence was accepted or rejected.
+- Detect duplicate or copied sources so repetition is not counted as
+  independent confirmation.
+- Add freshness handling for current-event claims.
 
-### Phase 2 — Stabilize the existing prototype
+### Exit criteria
 
-Make current text, URL, OCR, index, model, and frontend behavior reproducibly runnable. Separate provider dependencies, fix readiness reporting, add startup/smoke checks, and render all extracted claims.
+- Controlled tests cover supported, refuted, conflicting, and unknown claims.
+- Generic contextual headlines do not create a refuted result.
+- Every final status has inspectable evidence and a reason.
 
-### Phase 3 — Common modality schema
+## Phase B — Phishing investigation
 
-Define modality-neutral case, input, claim, signal, evidence, and result contracts that can represent text, image, URL, audio, and video.
+### Goal
 
-### Phase 4 — Reusable claim-verification service
+Make suspicious-message and suspicious-URL analysis the strongest useful
+demonstration.
 
-Separate input ingestion from claim extraction, retrieval, NLI verification, and claim-level results. Make the service reusable for OCR and later transcripts.
+### Work
 
-### Phase 5 — Phishing detection
+- Inspect redirects and final landing domains where safe.
+- Extract page title, forms, password fields, PIN fields, payment fields, and
+  brand references.
+- Detect sender/domain mismatch when sender metadata is provided.
+- Add domain and certificate signals without treating them as proof.
+- Compare claimed brands with configurable trusted domains.
+- Display each risk indicator with its source and confidence.
+- Return an actionable recommendation.
 
-Implement a provider-independent URL risk detector using controlled lexical, domain, redirect, credential, payment, and urgency signals. Add optional hosted reputation providers without making them mandatory.
+### Exit criteria
 
-### Phase 6 — Real image analysis
+- Controlled legitimate and phishing cases are both represented.
+- The result explains each major phishing signal.
+- Inaccessible pages produce `needs_review`, not `genuine`.
 
-Extend OCR with temporary image handling, hashes, metadata, screenshot indicators, and text-image processing.
+## Phase C — Genuine image analysis
 
-### Phase 7 — Cross-input correlation
+### Goal
 
-Detect shared claims, entities, URLs, domains, hashes, and similar content across inputs in one case.
+Move beyond OCR while preserving uncertainty.
 
-### Phase 8 — Decision fusion
+### Work
 
-Combine claim verification, phishing, image, and correlation signals into a documented genuine/deceptive decision with uncertainty handled internally.
+- Check whether the configured hosted account exposes a vision-capable model.
+- Add an adapter that sends image pixels only when supported.
+- Return structured scene observations, visible text, claim-relevant objects,
+  manipulation indicators, confidence, and limitations.
+- Keep “unusual” separate from “manipulated.”
+- Compare image observations with accompanying text and URL.
+- Never infer authenticity from missing EXIF data alone.
 
-### Phase 9 — Asynchronous audio support
+### Exit criteria
 
-Add temporary audio uploads, background processing, transcription through a replaceable provider, claim verification, and correlation with existing case inputs.
+- Text screenshots use OCR and claim verification.
+- Non-text images return visual observations or an explicit unavailable status.
+- Unusual images can produce `needs_review` rather than an unsupported
+  genuine/deceptive claim.
 
-### Integration milestone — End-to-end manual case
+## Phase D — Coordination analysis
 
-After Phase 9, connect the implemented services through one manual case-analysis endpoint and frontend action. The case must collect text, URL, image, and transcript-backed audio inputs; produce claim, phishing, image, and correlation signals; and return one fused genuine/deceptive result. This milestone is required before adding more advanced models or continuous monitoring.
+### Goal
 
-## Deferred work
+Make cross-input coordination more than simple similarity.
 
-- Video processing and video forensics
-- Continuous listening or source monitoring
-- Production authentication and multi-user operation
-- Large public dataset integration
-- Advanced explainability research
-- Full deepfake detection across all modalities
+### Work
+
+- Track repeated claims and URLs across inputs.
+- Compare image perceptual hashes.
+- Detect near-duplicate wording and translated variants.
+- Record timestamps where available.
+- Distinguish shared origin from independent corroboration.
+- Present a structured coordination explanation.
+
+### Exit criteria
+
+- Cases show why inputs appear coordinated.
+- Shared content is not incorrectly counted as independent evidence.
+
+## Phase E — Controlled evaluation
+
+### Goal
+
+Measure the prototype instead of relying on selected demonstrations.
+
+### Dataset groups
+
+- Supported, refuted, conflicting, outdated, and unknown claims
+- Legitimate messages
+- Bank, delivery, job, government, and account-recovery scams
+- Genuine and edited screenshots
+- Text-bearing and non-text images
+- Consistent and inconsistent multimodal cases
+
+### Metrics
+
+- Claim-status accuracy
+- Phishing precision, recall, and F1
+- False-positive and false-negative rates
+- Abstention rate
+- Evidence-source coverage
+- Confidence calibration
+- Coordination precision
+
+### Exit criteria
+
+- Cases have independent labels and review notes.
+- Results document limitations and uncertainty.
+- No general accuracy claim is made from demo cases alone.
+
+## Phase F — Audio and video
+
+Audio and video remain secondary until the text, phishing, image, and
+evaluation workflow is reliable. Add them only with real transcription or
+feature extraction, temporary media processing, asynchronous status tracking,
+modality-specific evidence, and evaluation data.
+
+## Non-goals
+
+- Proving that a sender intentionally lied.
+- Automatically declaring every unusual image fake.
+- Presenting heuristic risk scores as probabilities.
+- Claiming complete internet coverage.
+- Building permanent surveillance or permanent upload storage.

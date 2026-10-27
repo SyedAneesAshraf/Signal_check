@@ -2,7 +2,7 @@
 
 ## Status
 
-Current phase: **Phase 9 — Asynchronous audio support**
+Current phase: **Core manual verification milestone complete; Phase A — reliable claim verification next**
 
 Started: 2026-10-27
 
@@ -66,17 +66,23 @@ Create a temporary, manual case container that can hold related text, URL, and i
 - End-to-end case integration test: **passed** with a deceptive fused result.
 - Full backend suite after case integration: **65 passed**.
 - Frontend production build after case integration: **passed**.
+- Full backend regression suite after abstention, provenance, intent-separation, and contradiction-guard changes: **78 passed**.
+- Frontend production build after result-model and UI changes: **passed**.
+- Live backend health check after restart: **ready**.
+- Live text smoke test completed successfully; an ambiguous Earth-shape headline no longer creates a direct refutation.
+- Live combined phishing smoke test completed successfully with `deceptive`, high deception risk, and `not_determinable_from_content` intent.
 
 ### Remaining limitations
 
 - Case storage is expected to be process-local during the research prototype.
 - Advanced hosted transcription is still deferred; audio cases currently require a transcript for completed processing.
 - Raw uploads must remain temporary and must not be exposed in API responses.
-- Real BART NLI model loading has not yet been validated in this environment.
 - The generated index is ignored by Git and must be rebuilt by each environment that uses local retrieval.
 - The current audio implementation accepts a supplied transcript through a replaceable adapter; a real hosted speech-to-text provider still needs configuration.
 - The current case endpoint includes image metadata and OCR signals, but it does not yet infer image manipulation risk from pixels.
 - URL analysis uses deterministic local signals; external reputation providers are not required yet.
+- Sender intent is not inferable from content alone; `deceptive` means high content-risk, not proven malicious intent.
+- The prototype risk score is not a calibrated probability.
 
 ## Phase history
 
@@ -89,6 +95,6 @@ Create a temporary, manual case container that can hold related text, URL, and i
 | 5. Phishing detection | Complete | Deterministic URL/page risk assessment implemented and tested |
 | 6. Image analysis | In progress | Metadata, OCR, OCR claim verification, and conservative `needs_review` behavior implemented; pixel-level vision analysis remains |
 | 7. Cross-input correlation | Complete | Shared URL/entity/similarity signals implemented and tested |
-| 8. Decision fusion | Complete | Weighted genuine/deceptive fusion service implemented and tested |
+| 8. Decision fusion | Complete | Weighted risk fusion with abstention, decision basis, recommendation, and intent separation implemented and tested |
 | 9. Audio support | Complete with limitation | Async audio case ingestion and transcript adapter implemented; hosted STT remains |
-| Integration milestone | Complete with limitation | Backend and frontend now run a combined manual case; advanced image/audio models remain future work |
+| Integration milestone | Complete with limitation | Backend and frontend run combined manual cases; advanced image/audio models, calibrated evaluation, and deeper phishing inspection remain future work |

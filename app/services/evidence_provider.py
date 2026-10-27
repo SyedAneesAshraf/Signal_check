@@ -1,0 +1,319 @@
+"""Pluggable evidence sources for the text verification pipeline."""
+
+from dataclasses import dataclass
+from datetime import date
+from email.utils import parsedate_to_datetime
+import logging
+import os
+import re
+from typing import Any, Protocol
+from urllib.parse import urlsplit, urlunsplit
+from xml.etree import ElementTree
+
+from app.services.retriever import EmbeddingModel, EvidenceIndex
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RetrievedEvidence:
+    passage_id: str
+    title: str
+    source_name: str
+    source_url: str | None
+    published_date: str | None
+    passage: str
+    retrieval_similarity: float
+    source_type: str
+    source_quality: str
+    retrieved_date: str
+    provider: str
+    source_quality_weight: float
+    last_updated_date: str | None = None
+    domain: str | None = None
+
+
+class EvidenceProvider(Protocol):
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        """Return ranked evidence for a claim."""
+
+
+class LocalEvidenceProvider:
+    def __init__(
+        self,
+        evidence_index: EvidenceIndex,
+        embedder: EmbeddingModel,
+    ) -> None:
+        self._evidence_index = evidence_index
+        self._embedder = embedder
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        return [
+            RetrievedEvidence(
+                passage_id=passage.passage_id,
+                title=passage.title,
+                source_name=passage.source_name,
+                source_url=passage.source_url,
+                published_date=passage.published_date,
+                passage=passage.text,
+                retrieval_similarity=similarity,
+                source_type=passage.source_type,
+                source_quality=_quality_from_source_type(passage.source_type),
+                retrieved_date=passage.retrieved_date,
+                provider="local",
+                source_quality_weight=_source_quality_weight(
+                    _quality_from_source_type(passage.source_type)
+                ),
+                last_updated_date=passage.last_updated_date,
+                domain=passage.domain,
+            )
+            for passage, similarity in self._evidence_index.search(
+                query,
+                self._embedder,
+                top_k=top_k,
+            )
+        ]
+
+
+class LiveNewsEvidenceProvider:
+    """Search current news through Google's public RSS feed without an API key."""
+
+    endpoint = "https://news.google.com/rss/search"
+
+    def __init__(self, timeout: float = 20.0) -> None:
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero.")
+        self._timeout = timeout
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        if not query.strip():
+            raise ValueError("query must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        import httpx
+
+        try:
+            response = httpx.get(
+                self.endpoint,
+                params={"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"},
+                headers={"User-Agent": "evidence-verification/0.1"},
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            root = ElementTree.fromstring(response.content)
+        except httpx.HTTPError as error:
+            logger.warning(
+                "evidence_search_failed provider=google_news query=%r error=%s",
+                query,
+                type(error).__name__,
+            )
+            raise RuntimeError("Live news search failed.") from error
+        except ElementTree.ParseError as error:
+            logger.warning(
+                "evidence_rss_parse_failed provider=google_news query=%r error=%s",
+                query,
+                type(error).__name__,
+            )
+            raise RuntimeError("Live news search returned invalid RSS.") from error
+
+        results: list[RetrievedEvidence] = []
+        seen_urls: set[str] = set()
+        raw_items = root.findall("./channel/item")
+        for index, item in enumerate(raw_items[:top_k]):
+            title = _xml_text(item.find("title"))
+            url = _xml_text(item.find("link"))
+            description = _xml_text(item.find("description"))
+            source = _xml_text(item.find("source")) or _hostname(url)
+            if not title or not url or not description:
+                continue
+            canonical_url = _canonical_url(url)
+            if canonical_url and canonical_url in seen_urls:
+                continue
+            if canonical_url:
+                seen_urls.add(canonical_url)
+            passage = _strip_html(description)
+            published_date = _parse_published_date(_xml_text(item.find("pubDate")))
+            results.append(
+                RetrievedEvidence(
+                    passage_id=f"live_{index + 1}",
+                    title=title,
+                    source_name=source,
+                    source_url=url,
+                    published_date=published_date,
+                    passage=passage,
+                    retrieval_similarity=_query_similarity(query, title, passage),
+                    source_type="live_news_result",
+                    source_quality=_live_source_quality(url),
+                    retrieved_date=date.today().isoformat(),
+                    provider="live",
+                    source_quality_weight=_source_quality_weight(
+                        _live_source_quality(url)
+                    ),
+                    domain=_hostname(url),
+                )
+            )
+        logger.info(
+            "evidence_search provider=google_news query=%r http_status=%s "
+            "raw_results=%d parsed_results=%d deduplicated_results=%d",
+            query,
+            getattr(response, "status_code", "unknown"),
+            len(raw_items),
+            len(results),
+            len(seen_urls),
+        )
+        return results
+
+
+class TavilyEvidenceProvider:
+    """Search Tavily results; requires TAVILY_API_KEY and never silently falls back."""
+
+    endpoint = "https://api.tavily.com/search"
+
+    def __init__(self, api_key: str | None = None, timeout: float = 15.0) -> None:
+        self._api_key = api_key or os.getenv("TAVILY_API_KEY")
+        if not self._api_key:
+            raise ValueError(
+                "TAVILY_API_KEY is required to enable live evidence retrieval."
+            )
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero.")
+        self._timeout = timeout
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        if not query.strip():
+            raise ValueError("query must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        import httpx
+
+        try:
+            response = httpx.post(
+                self.endpoint,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "api_key": self._api_key,
+                    "query": query,
+                    "search_depth": "advanced",
+                    "max_results": top_k,
+                    "include_answer": False,
+                    "include_raw_content": False,
+                },
+                timeout=self._timeout,
+            )
+            response.raise_for_status()
+            payload: Any = response.json()
+        except (httpx.HTTPError, ValueError) as error:
+            raise RuntimeError("Live evidence search failed.") from error
+
+        raw_results = payload.get("results") if isinstance(payload, dict) else None
+        if not isinstance(raw_results, list):
+            raise RuntimeError("Live evidence search returned an invalid response.")
+        results: list[RetrievedEvidence] = []
+        seen_urls: set[str] = set()
+        for index, item in enumerate(raw_results):
+            evidence = _parse_tavily_result(item, index)
+            canonical_url = _canonical_url(evidence.source_url)
+            if canonical_url and canonical_url in seen_urls:
+                continue
+            if canonical_url:
+                seen_urls.add(canonical_url)
+            results.append(evidence)
+        return results
+
+
+def _parse_tavily_result(item: Any, index: int) -> RetrievedEvidence:
+    if not isinstance(item, dict):
+        raise RuntimeError(f"Live evidence result {index} is invalid.")
+    title = item.get("title")
+    url = item.get("url")
+    content = item.get("content")
+    if not all(isinstance(value, str) and value.strip() for value in (title, url, content)):
+        raise RuntimeError(f"Live evidence result {index} is missing required fields.")
+    score = item.get("score", 0.0)
+    if not isinstance(score, (int, float)):
+        raise RuntimeError(f"Live evidence result {index} has an invalid score.")
+    return RetrievedEvidence(
+        passage_id=f"live_{index + 1}",
+        title=title,
+        source_name=url.split("/")[2] if "://" in url else url,
+        source_url=url,
+        published_date=None,
+        passage=content,
+        retrieval_similarity=float(score),
+        source_type="live_web_result",
+        source_quality="unknown",
+        retrieved_date=__import__("datetime").date.today().isoformat(),
+        provider="tavily",
+        source_quality_weight=_source_quality_weight("unknown"),
+    )
+
+
+def _xml_text(element: ElementTree.Element | None) -> str:
+    return "".join(element.itertext()).strip() if element is not None else ""
+
+
+def _strip_html(value: str) -> str:
+    return re.sub(r"<[^>]+>", " ", value).replace("&nbsp;", " ").strip()
+
+
+def _hostname(url: str | None) -> str:
+    return urlsplit(url or "").netloc.lower() or "unknown"
+
+
+def _parse_published_date(value: str) -> str | None:
+    if not value:
+        return None
+    try:
+        return parsedate_to_datetime(value).date().isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _query_similarity(query: str, title: str, passage: str) -> float:
+    query_words = set(re.findall(r"[a-z0-9]+", query.lower()))
+    result_words = set(re.findall(r"[a-z0-9]+", f"{title} {passage}".lower()))
+    if not query_words:
+        return 0.0
+    overlap = len(query_words & result_words) / len(query_words)
+    return min(0.95, max(0.3, overlap))
+
+
+def _live_source_quality(url: str) -> str:
+    hostname = _hostname(url)
+    if hostname.endswith((".gov", ".edu")):
+        return "official"
+    if hostname in {"reuters.com", "apnews.com", "bbc.com", "npr.org"}:
+        return "reputable"
+    return "unknown"
+
+
+def _quality_from_source_type(source_type: str) -> str:
+    if source_type.startswith("official_"):
+        return "official"
+    if source_type in {"reputable_news", "academic_reference"}:
+        return "reputable"
+    if source_type == "scope_note":
+        return "context_only"
+    return "unknown"
+
+
+def _source_quality_weight(source_quality: str) -> float:
+    return {
+        "official": 1.0,
+        "reputable": 0.95,
+        "unknown": 0.8,
+        "context_only": 0.5,
+    }.get(source_quality, 0.8)
+
+
+def _canonical_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    parsed = urlsplit(url.strip())
+    if not parsed.scheme or not parsed.netloc:
+        return url.strip().lower().rstrip("/")
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "")
+    )

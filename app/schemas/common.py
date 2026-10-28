@@ -38,6 +38,9 @@ class CaseInputContract(BaseModel):
     file_name: str | None = None
     mime_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
+    transcription_status: str | None = None
+    transcription_error: str | None = None
+    audio_meta: dict[str, Any] | None = None
 
 
 class ClaimContract(BaseModel):
@@ -78,6 +81,12 @@ class EvidenceContract(BaseModel):
     domain: str | None = None
 
 
+class ExplanationItem(BaseModel):
+    kind: str  # risk | cross_channel | claim | reassurance | info
+    text: str
+    refs: list[str] = Field(default_factory=list)  # input ids or evidence ids behind the statement
+
+
 class CaseAnalysisContract(BaseModel):
     case_id: str
     status: ProcessingStatus
@@ -94,3 +103,5 @@ class CaseAnalysisContract(BaseModel):
     content_assessment: str | None = None
     deception_risk: str | None = None
     intent_assessment: str = "not_determinable_from_content"
+    risk_breakdown: dict[str, float] = Field(default_factory=dict)
+    explanation: list[ExplanationItem] = Field(default_factory=list)

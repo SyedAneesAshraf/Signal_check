@@ -38,7 +38,9 @@ def test_pipeline_returns_claims_evidence_and_status() -> None:
         top_k=1,
     )
 
-    claims, overall = pipeline.analyze("NASA published a climate report.")
+    claims, overall = pipeline.analyze(
+        "Washing hands with soap and water helps protect people from getting sick."
+    )
 
     assert overall == "supported"
     assert claims[0].status == "supported"
@@ -109,3 +111,20 @@ def test_pipeline_keeps_unrelated_life_status_results_out_of_nli() -> None:
     assert status == "insufficient_evidence"
     assert claims[0].evidence == []
     assert nli.called is False
+
+
+def test_unrelated_evidence_is_rejected_even_when_retrieval_returns_it() -> None:
+    documents = load_documents(Path("data/evidence/documents.json"))
+    pipeline = TextAnalysisPipeline(
+        LocalEvidenceProvider(
+            EvidenceIndex.build(split_into_passages(documents), Embedder()),
+            Embedder(),
+        ),
+        NLI(),  # would "entail" anything, so only the relevance gate can stop it
+        top_k=1,
+    )
+
+    claims, overall = pipeline.analyze("NASA published a climate report.")
+
+    assert overall == "insufficient_evidence"
+    assert claims[0].evidence == []

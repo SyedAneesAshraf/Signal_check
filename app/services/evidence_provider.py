@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import date
 from email.utils import parsedate_to_datetime
+import html
 import logging
 import os
 import re
@@ -191,12 +192,7 @@ class WikipediaEvidenceProvider:
                     "q": query,
                     "limit": top_k,
                 },
-                headers={
-                    "User-Agent": (
-                        "MultimodalEvidenceResearch/0.1 "
-                        "(contact: research@example.com)"
-                    )
-                },
+                headers={"User-Agent": _wikimedia_user_agent()},
                 timeout=self._timeout,
             )
             response.raise_for_status()
@@ -219,6 +215,8 @@ class WikipediaEvidenceProvider:
                 continue
             title = page.get("title")
             passage = page.get("excerpt")
+            if isinstance(passage, str):
+                passage = _strip_html(passage)
             key = page.get("key")
             url = f"https://en.wikipedia.org/wiki/{key}" if isinstance(key, str) else None
             if not all(
@@ -246,6 +244,62 @@ class WikipediaEvidenceProvider:
         return results
 
 
+class DuckDuckGoEvidenceProvider:
+    """General web search through DuckDuckGo. Needs no API key.
+
+    Result bodies are real text snippets, which gives the NLI model far more to
+    work with than a bare news headline.
+    """
+
+    _max_passage_chars = 1200
+
+    def search(self, query: str, *, top_k: int) -> list[RetrievedEvidence]:
+        if not query.strip():
+            raise ValueError("query must not be empty.")
+        if top_k <= 0:
+            raise ValueError("top_k must be greater than zero.")
+
+        from ddgs import DDGS
+        from ddgs.exceptions import DDGSException
+
+        try:
+            rows = DDGS().text(query, max_results=top_k)
+        except DDGSException as error:
+            logger.warning(
+                "evidence_search_failed provider=duckduckgo query=%r error=%s",
+                query,
+                type(error).__name__,
+            )
+            raise RuntimeError("DuckDuckGo search failed.") from error
+
+        results: list[RetrievedEvidence] = []
+        for index, row in enumerate(rows):
+            title = _strip_html(str(row.get("title") or ""))
+            url = str(row.get("href") or "")
+            passage = _strip_html(str(row.get("body") or ""))[: self._max_passage_chars]
+            if not title or not url or not passage:
+                continue
+            quality = _live_source_quality(url)
+            results.append(
+                RetrievedEvidence(
+                    passage_id=f"ddg_{index + 1}",
+                    title=title,
+                    source_name=_hostname(url),
+                    source_url=url,
+                    published_date=None,
+                    passage=passage,
+                    retrieval_similarity=_query_similarity(query, title, passage),
+                    source_type="web_search",
+                    source_quality=quality,
+                    retrieved_date=date.today().isoformat(),
+                    provider="duckduckgo",
+                    source_quality_weight=_source_quality_weight(quality),
+                    domain=_hostname(url),
+                )
+            )
+        return results
+
+
 class HybridEvidenceProvider:
     """Combine reference, current-news, and optional general-web evidence."""
 
@@ -255,13 +309,21 @@ class HybridEvidenceProvider:
         timeout: float = 20.0,
         include_tavily: bool | None = None,
         failure_cooldown_seconds: float = 60.0,
+        cache: Any | None = None,
     ) -> None:
         if failure_cooldown_seconds < 0:
             raise ValueError("failure_cooldown_seconds must not be negative.")
         self._providers: list[EvidenceProvider] = [
             WikipediaEvidenceProvider(timeout=timeout),
+            DuckDuckGoEvidenceProvider(),
             LiveNewsEvidenceProvider(),
         ]
+        if cache is not None:
+            from app.services.cache import CachedEvidenceProvider
+
+            self._providers = [
+                CachedEvidenceProvider(provider, cache) for provider in self._providers
+            ]
         self._reference_cache: dict[str, list[RetrievedEvidence]] = {}
         self._reference_failures: dict[str, float] = {}
         self._failure_cooldown_seconds = failure_cooldown_seconds
@@ -274,7 +336,7 @@ class HybridEvidenceProvider:
         seen_urls: set[str] = set()
         for provider in self._providers:
             try:
-                if isinstance(provider, WikipediaEvidenceProvider):
+                if isinstance(getattr(provider, "inner", provider), WikipediaEvidenceProvider):
                     cache_key = _reference_query_key(query)
                     provider_results = self._reference_cache.get(cache_key)
                     failed_at = self._reference_failures.get(cache_key)
@@ -330,7 +392,7 @@ class HybridEvidenceProvider:
                 item.source_quality_weight,
             ),
             reverse=True,
-        )[:top_k]
+        )[: top_k * 2]
 
 
 class TavilyEvidenceProvider:
@@ -422,8 +484,16 @@ def _xml_text(element: ElementTree.Element | None) -> str:
     return "".join(element.itertext()).strip() if element is not None else ""
 
 
+def _wikimedia_user_agent() -> str:
+    """Wikimedia's API policy asks for a contact in the user agent; set WIKIMEDIA_CONTACT to provide one."""
+    contact = os.getenv("WIKIMEDIA_CONTACT", "").strip() or "research@example.com"
+    return f"MultimodalEvidenceResearch/0.1 (contact: {contact})"
+
+
 def _strip_html(value: str) -> str:
-    return re.sub(r"<[^>]+>", " ", value).replace("&nbsp;", " ").strip()
+    """Remove tags, decode entities, and collapse whitespace."""
+    text = html.unescape(re.sub(r"<[^>]+>", "", value))
+    return " ".join(text.replace(" ", " ").split())
 
 
 def _hostname(url: str | None) -> str:
@@ -457,18 +527,32 @@ def _reference_query_key(query: str) -> str:
     )
 
 
+_REPUTABLE_DOMAINS = frozenset(
+    {
+        "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "npr.org", "theguardian.com", "nytimes.com",
+        "washingtonpost.com", "nature.com", "science.org", "who.int",
+        # fact-checking organisations
+        "snopes.com", "factcheck.org", "politifact.com", "fullfact.org", "afp.com", "boomlive.in", "altnews.in",
+        # encyclopedias and established science / health references
+        "britannica.com", "scientificamerican.com", "nationalgeographic.com", "smithsonianmag.com",
+        "newscientist.com", "sciencenews.org", "livescience.com", "space.com", "mayoclinic.org",
+        "clevelandclinic.org", "hopkinsmedicine.org", "ourworldindata.org", "khanacademy.org", "merriam-webster.com",
+        # established news organisations
+        "cnn.com", "cbsnews.com", "nbcnews.com", "abcnews.go.com", "aljazeera.com", "dw.com", "france24.com",
+        "economist.com", "wsj.com", "bloomberg.com", "ft.com", "time.com", "pbs.org", "theatlantic.com",
+    }
+)
+_OFFICIAL_SUFFIXES = (".gov", ".edu", ".mil", ".int", ".ac.uk", ".gov.uk", ".gov.au", ".edu.au", ".gov.in", ".ac.in")
+_AI_GENERATED_REFERENCE_HOSTS = {"grokipedia.com"}
+
+
 def _live_source_quality(url: str) -> str:
     hostname = _hostname(url)
-    if hostname.endswith((".gov", ".edu")) or hostname.endswith(".wikipedia.org"):
+    if hostname in _AI_GENERATED_REFERENCE_HOSTS:
+        return "context_only"
+    if hostname.endswith(_OFFICIAL_SUFFIXES) or hostname.endswith(".wikipedia.org"):
         return "official"
-    if hostname in {
-        "reuters.com",
-        "apnews.com",
-        "bbc.com",
-        "npr.org",
-        "theguardian.com",
-        "nytimes.com",
-    }:
+    if any(hostname == domain or hostname.endswith("." + domain) for domain in _REPUTABLE_DOMAINS):
         return "reputable"
     return "unknown"
 

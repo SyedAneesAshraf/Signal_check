@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import logging
+import os
 import re
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -15,6 +16,7 @@ from app.services.verifier import (
     VerificationSignal,
     aggregate_evidence_status,
     is_directly_relevant,
+    is_fiction_source,
     verify_claim,
 )
 
@@ -67,6 +69,10 @@ class TextAnalysisPipeline:
         self._nli_model = nli_model
         self._top_k = top_k
         self._minimum_similarity = minimum_similarity
+
+    @property
+    def nli_model(self) -> NLIModel:
+        return self._nli_model
 
     def analyze(self, text: str) -> tuple[list[PipelineClaim], str]:
         logger.info("text_analysis_started input_length=%d", len(text))
@@ -122,6 +128,13 @@ class TextAnalysisPipeline:
         similarity_count = 0
         nli_count = 0
         for item in retrieved:
+            if is_fiction_source(item.title):
+                logger.info(
+                    "evidence_rejected stage=fiction_source claim=%r title=%r",
+                    claim.claim_text,
+                    item.title,
+                )
+                continue
             if not is_directly_relevant(claim.claim_text, f"{item.title}. {item.passage}"):
                 logger.info(
                     "evidence_rejected stage=relevance claim=%r title=%r",
@@ -143,7 +156,7 @@ class TextAnalysisPipeline:
             signal = verify_claim(claim.claim_text, item.passage, self._nli_model)
             nli_count += 1
             assessments.append(
-                EvidenceAssessment(signal, item.retrieval_similarity, item.source_quality)
+                EvidenceAssessment(signal, item.retrieval_similarity, item.source_quality, item.domain or item.source_name)
             )
             evidence.append(
                 PipelineEvidence(
@@ -201,7 +214,7 @@ def build_default_pipeline(
         LocalEvidenceProvider,
         TavilyEvidenceProvider,
     )
-    from app.services.verifier import BartNLIModel
+    from app.services.verifier import DEFAULT_NLI_MODEL, BartNLIModel
 
     if evidence_provider == "local":
         from app.services.retriever import EvidenceIndex, SentenceTransformerEmbedder
@@ -213,7 +226,9 @@ def build_default_pipeline(
         )
         provider: EvidenceProvider = LocalEvidenceProvider(index, embedder)
     elif evidence_provider == "live":
-        provider = HybridEvidenceProvider()
+        from app.services.cache import default_cache
+
+        provider = HybridEvidenceProvider(cache=default_cache())
     elif evidence_provider == "tavily":
         try:
             provider = TavilyEvidenceProvider()
@@ -227,7 +242,7 @@ def build_default_pipeline(
 
     return TextAnalysisPipeline(
         evidence_provider=provider,
-        nli_model=BartNLIModel(),
+        nli_model=BartNLIModel(os.getenv("NLI_MODEL", DEFAULT_NLI_MODEL)),
         top_k=top_k,
         minimum_similarity=minimum_similarity,
     )

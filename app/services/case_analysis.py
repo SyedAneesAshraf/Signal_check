@@ -1,36 +1,44 @@
 """End-to-end analysis for a manually collected verification case."""
 
-from collections.abc import Callable
 import logging
 
 from app.schemas.common import (
     CaseAnalysisContract,
     CaseInputContract,
-    ClaimContract,
-    EvidenceContract,
     InputType,
     ModalitySignal,
     ProcessingStatus,
 )
+from app.services.adapters import ADAPTERS, AdapterContext, AdapterOutput, TextAnalyzer
 from app.services.case_store import VerificationCase
+from app.services.case_explanation import build_explanation
 from app.services.correlation import correlate_texts
-from app.services.fusion import fuse_signals
-from app.services.image_analysis import assess_image
+from app.services.cross_channel import MAX_CROSS_CHANNEL_SCORE, ChannelInput, analyze_cross_channel
+from app.services.reputation import default_reputation
+from app.services.fusion import REVIEW_THRESHOLD, fuse_signals
 from app.services.investigator import investigate_case
-from app.services.multimodal import extract_image_text
-from app.services.phishing import assess_url
 
-
-TextAnalyzer = Callable[[str], tuple[list[object], str]]
 logger = logging.getLogger(__name__)
+
+AI_ESCALATION_CONFIDENCE = 0.6
+
+
+class _AiNotNeeded(Exception):
+    """Internal: skip the AI call when it cannot change the outcome."""
 
 
 def analyze_case(
     case: VerificationCase,
     *,
     text_analyzer: TextAnalyzer,
+    nli_model: object | None = None,
+    cross_channel: bool = True,
 ) -> CaseAnalysisContract:
-    """Analyze the available representations in a case and fuse their signals."""
+    """Run each input through its modality adapter, then fuse the signals.
+
+    The verdict comes only from deterministic fusion. The optional LLM
+    investigation is attached as an advisory second opinion and never changes it.
+    """
     inputs = [
         CaseInputContract(
             input_id=item.input_id,
@@ -42,174 +50,39 @@ def analyze_case(
             file_name=item.file_name,
             mime_type=item.mime_type,
             size_bytes=item.size_bytes,
+            transcription_status=item.transcription_status,
+            transcription_error=item.transcription_error,
+            audio_meta=item.audio_meta,
         )
         for item in case.inputs
     ]
-    claims: list[ClaimContract] = []
-    evidence: list[EvidenceContract] = []
-    signals: list[ModalitySignal] = []
-    text_items: list[tuple[str, str]] = []
-    contradiction_score = 0.0
-    phishing_score = 0.0
-    image_anomaly_score = 0.0
-    image_context: list[dict[str, object]] = []
-    related_message_text = " ".join(
-        item.text for item in case.inputs if item.text
+    context = AdapterContext(
+        text_analyzer=text_analyzer,
+        related_message_text=" ".join(item.text for item in case.inputs if item.text),
+        urls=[item.source_url for item in case.inputs if item.source_url],
     )
-
+    merged = AdapterOutput()
     for item in case.inputs:
-        if item.source_url:
-            text_items.append((item.input_id, item.source_url))
-        if item.text:
-            text_items.append((item.input_id, item.text))
-            pipeline_claims, _ = text_analyzer(item.text)
-            for result in pipeline_claims:
-                claims.append(
-                    ClaimContract(
-                        claim_id=f"{item.input_id}_{result.claim.claim_id}",
-                        claim_text=result.claim.claim_text,
-                        source_input_ids=[item.input_id],
-                        entities=result.claim.entities,
-                        claim_type=result.claim.claim_type,
-                        verification_status=result.status,
-                    )
-                )
-                if result.status == "refuted":
-                    contradiction_score = max(
-                        contradiction_score,
-                        max((entry.nli_score for entry in result.evidence), default=0.0),
-                    )
-                evidence.extend(
-                    EvidenceContract(
-                        evidence_id=f"{item.input_id}_{entry.passage_id}",
-                        claim_id=f"{item.input_id}_{result.claim.claim_id}",
-                        passage=entry.passage,
-                        source_url=entry.source_url,
-                        source_name=entry.source_name,
-                        retrieval_score=max(0.0, min(1.0, entry.retrieval_similarity)),
-                        nli_label=entry.nli_label,
-                        nli_score=entry.nli_score,
-                        source_type=entry.source_type,
-                        source_quality=entry.source_quality,
-                        source_quality_weight=entry.source_quality_weight,
-                        published_date=entry.published_date,
-                        retrieved_date=entry.retrieved_date,
-                        provider=entry.provider,
-                        domain=entry.domain,
-                    )
-                    for entry in result.evidence
-                )
+        adapter = ADAPTERS.get(item.input_type)
+        if adapter is None:
+            logger.warning("no_adapter input_type=%s", item.input_type)
+            continue
+        output = adapter.analyze(item, context)
+        merged.claims.extend(output.claims)
+        merged.evidence.extend(output.evidence)
+        merged.signals.extend(output.signals)
+        merged.text_items.extend(output.text_items)
+        merged.image_context.extend(output.image_context)
+        merged.contradiction = max(merged.contradiction, output.contradiction)
+        merged.phishing = max(merged.phishing, output.phishing)
+        merged.image_anomaly = max(merged.image_anomaly, output.image_anomaly)
+        merged.urls_checked += output.urls_checked
+        merged.urls_trusted += output.urls_trusted
+        merged.media_needing_review += output.media_needing_review
 
-        if item.input_type == "url" and item.source_url:
-            assessment = assess_url(item.source_url, related_message_text)
-            phishing_score = max(phishing_score, assessment.risk_score)
-            signals.append(
-                ModalitySignal(
-                    signal_id=f"{item.input_id}_phishing",
-                    input_id=item.input_id,
-                    modality=InputType.URL,
-                    signal_type="phishing_risk",
-                    status=ProcessingStatus.COMPLETED,
-                    score=assessment.risk_score,
-                    confidence=1.0,
-                    details={
-                        "status": assessment.status,
-                        "indicators": list(assessment.indicators),
-                    },
-                )
-            )
-
-        if item.input_type == "image" and item.raw_content:
-            image = assess_image(item.raw_content)
-            ocr_text = ""
-            try:
-                ocr_text = extract_image_text(item.raw_content)
-            except (OSError, RuntimeError, ValueError) as error:
-                logger.warning(
-                    "case_image_ocr_failed input_id=%s error=%s",
-                    item.input_id,
-                    type(error).__name__,
-                )
-            if ocr_text:
-                text_items.append((item.input_id, ocr_text))
-                pipeline_claims, _ = text_analyzer(ocr_text)
-                for result in pipeline_claims:
-                    claims.append(
-                        ClaimContract(
-                            claim_id=f"{item.input_id}_{result.claim.claim_id}",
-                            claim_text=result.claim.claim_text,
-                            source_input_ids=[item.input_id],
-                            entities=result.claim.entities,
-                            claim_type=result.claim.claim_type,
-                            verification_status=result.status,
-                        )
-                    )
-                    if result.status == "refuted":
-                        contradiction_score = max(
-                            contradiction_score,
-                            max((entry.nli_score for entry in result.evidence), default=0.0),
-                        )
-                    evidence.extend(
-                        EvidenceContract(
-                            evidence_id=f"{item.input_id}_{entry.passage_id}",
-                            claim_id=f"{item.input_id}_{result.claim.claim_id}",
-                            passage=entry.passage,
-                            source_url=entry.source_url,
-                            source_name=entry.source_name,
-                            retrieval_score=max(0.0, min(1.0, entry.retrieval_similarity)),
-                            nli_label=entry.nli_label,
-                            nli_score=entry.nli_score,
-                            source_type=entry.source_type,
-                            source_quality=entry.source_quality,
-                            source_quality_weight=entry.source_quality_weight,
-                            published_date=entry.published_date,
-                            retrieved_date=entry.retrieved_date,
-                            provider=entry.provider,
-                            domain=entry.domain,
-                        )
-                        for entry in result.evidence
-                    )
-            image_context.append(
-                {
-                    "input_id": item.input_id,
-                    "ocr_text": ocr_text,
-                    "width": image.width,
-                    "height": image.height,
-                    "format": image.format,
-                    "has_metadata": image.has_metadata,
-                    "perceptual_hash": image.perceptual_hash,
-                    "visual_truth_status": (
-                        "needs_review"
-                        if not ocr_text
-                        else "text_extracted_only"
-                    ),
-                }
-            )
-            signals.append(
-                ModalitySignal(
-                    signal_id=f"{item.input_id}_image",
-                    input_id=item.input_id,
-                    modality=InputType.IMAGE,
-                    signal_type="image_metadata",
-                    status=ProcessingStatus.COMPLETED,
-                    score=0.0,
-                    confidence=1.0,
-                    details={
-                        "width": image.width,
-                        "height": image.height,
-                        "format": image.format,
-                        "has_metadata": image.has_metadata,
-                        "perceptual_hash": image.perceptual_hash,
-                        "ocr_text": ocr_text,
-                        "visual_truth_status": (
-                            "needs_review" if not ocr_text else "text_extracted_only"
-                        ),
-                    },
-                )
-            )
-
-    correlation = correlate_texts(text_items)
-    if text_items:
+    claims, evidence, signals = merged.claims, merged.evidence, merged.signals
+    correlation = correlate_texts(merged.text_items)
+    if merged.text_items:
         signals.append(
             ModalitySignal(
                 signal_id=f"{case.case_id}_correlation",
@@ -227,23 +100,63 @@ def analyze_case(
             )
         )
 
+    cross_findings = []
+    if cross_channel and len(case.inputs) > 1:
+        ocr_by_input = {image["input_id"]: image.get("ocr_text") or "" for image in merged.image_context}
+        channel_inputs = [
+            ChannelInput(item.input_id, item.input_type, item.text or ocr_by_input.get(item.input_id, ""))
+            for item in case.inputs
+        ]
+        cross_findings = analyze_cross_channel(channel_inputs, default_reputation(), claims=claims, nli=nli_model)
+    cross_score = min(MAX_CROSS_CHANNEL_SCORE, sum(finding.weight for finding in cross_findings))
+    if cross_findings:
+        signals.append(
+            ModalitySignal(
+                signal_id=f"{case.case_id}_cross_channel",
+                input_id=case.case_id,
+                modality=InputType.TEXT,
+                signal_type="cross_channel",
+                status=ProcessingStatus.COMPLETED,
+                score=cross_score,
+                confidence=1.0,
+                details={
+                    "indicators": [finding.indicator for finding in cross_findings],
+                    "findings": [
+                        {"indicator": f.indicator, "detail": f.detail, "input_ids": list(f.input_ids)}
+                        for f in cross_findings
+                    ],
+                },
+            )
+        )
+
+    statuses = {claim.verification_status for claim in claims}
+    has_support = "supported" in statuses and not statuses & {"refuted", "conflicting_evidence"}
+    trusted_domain = merged.urls_checked > 0 and merged.urls_trusted == merged.urls_checked
     fusion = fuse_signals(
-        claim_contradiction=contradiction_score,
-        phishing=phishing_score,
+        claim_contradiction=merged.contradiction,
+        phishing=merged.phishing,
         coordination=correlation.score,
-        image_anomaly=image_anomaly_score,
-        has_evidence=bool(evidence),
+        image_anomaly=merged.image_anomaly,
+        cross_channel=cross_score,
+        has_evidence=has_support,
+        trusted_domain=trusted_domain,
     )
     ai_investigation = None
     ai_investigation_error = None
     try:
+        if fusion.verdict == "deceptive":
+            raise _AiNotNeeded  # the AI can only add caution, and this verdict already has the most
+        if fusion.verdict == "genuine" and not has_support:
+            raise _AiNotNeeded  # genuine via a trusted link rests on hard domain evidence the AI cannot improve
         ai_investigation = investigate_case(
-            message_text=related_message_text,
+            message_text=context.related_message_text,
             urls=[item.source_url for item in case.inputs if item.source_url],
             claims=[claim.model_dump() for claim in claims],
             evidence=[item.model_dump() for item in evidence],
-            images=image_context,
+            images=merged.image_context,
         )
+    except _AiNotNeeded:
+        pass
     except RuntimeError as error:
         logger.warning(
             "ai_investigation_unavailable error=%s",
@@ -254,18 +167,28 @@ def analyze_case(
             "status": "unavailable",
             "message": str(error),
         }
+
     verdict = fusion.verdict
     risk_score = fusion.risk_score
     image_requires_review = any(
-        image["visual_truth_status"] == "needs_review" for image in image_context
+        image["visual_truth_status"] == "needs_review" for image in merged.image_context
     )
-    if ai_investigation is not None and (
-        ai_investigation.verdict != "genuine"
-        or bool(evidence)
-        or ai_investigation.confidence >= 0.8
-    ):
-        verdict = ai_investigation.verdict
-        risk_score = ai_investigation.risk_score
+    # The AI may only make a verdict more cautious, never clear anything or call something deceptive on its own.
+    ai_escalated = (
+        verdict == "genuine"
+        and ai_investigation is not None
+        and ai_investigation.verdict == "deceptive"
+        and ai_investigation.confidence >= AI_ESCALATION_CONFIDENCE
+    )
+    if ai_escalated:
+        verdict = "needs_review"
+        risk_score = max(risk_score, REVIEW_THRESHOLD)
+    if verdict == "genuine" and "conflicting_evidence" in statuses:
+        verdict = "needs_review"
+        risk_score = max(risk_score, REVIEW_THRESHOLD)
+    if merged.media_needing_review and verdict == "genuine":
+        verdict = "needs_review"  # a recording with no intelligible speech cannot be verified
+        risk_score = max(risk_score, 0.5)
     if image_requires_review and verdict == "genuine":
         verdict = "needs_review"
         risk_score = max(risk_score, 0.5)
@@ -273,10 +196,34 @@ def analyze_case(
         decision_basis = "Strong phishing, contradiction, or coordinated-risk signals crossed the decision threshold."
         recommended_action = "Do not trust the content or submit credentials; verify through an independent official channel."
         deception_risk = "high"
-    elif evidence:
-        decision_basis = "The available claim evidence did not indicate deception, but this is not proof of authenticity."
+    elif has_support and verdict == "genuine":
+        decision_basis = "The claims were supported by the retrieved evidence and no risk indicators were found, but this is not proof of authenticity."
         recommended_action = "Review the linked sources and confirm the claim through an independent trusted source."
         deception_risk = "low"
+    elif verdict == "genuine" and trusted_domain:
+        decision_basis = "The linked site is a long-established, widely used domain and no phishing indicators were found, but this is not proof that the message itself is authentic."
+        recommended_action = "If you were not expecting this message, open the service directly instead of using the link."
+        deception_risk = "low"
+    elif verdict == "needs_review" and risk_score >= REVIEW_THRESHOLD:
+        found = sorted(
+            {
+                indicator
+                for signal in signals
+                for indicator in signal.details.get("indicators", [])
+            }
+            | {
+                "image does not match its caption"
+                for signal in signals
+                if signal.signal_type == "image_text_consistency" and not signal.details.get("consistent", True)
+            }
+            | ({"the AI investigator judged this likely deceptive"} if ai_escalated else set())
+        )
+        decision_basis = (
+            "Some risk indicators were found, but not enough to call this deceptive"
+            + (f": {', '.join(name.replace('_', ' ') for name in found)}." if found else ".")
+        )
+        recommended_action = "Do not click links or share information until you have verified this through an official channel."
+        deception_risk = "elevated"
     else:
         decision_basis = "There was not enough relevant, source-linked evidence to make a reliable decision."
         recommended_action = "Treat the content as unverified and seek confirmation from an independent trusted source."
@@ -292,9 +239,28 @@ def analyze_case(
         "A missing or inaccessible webpage is not evidence that the content is genuine.",
         "Image analysis currently verifies OCR text and metadata; it does not prove visual authenticity or detect deepfakes.",
     ]
-    investigation_payload = (
-        ai_investigation.__dict__ if ai_investigation is not None else ai_investigation_error
-    )
+    if any(item.input_type == "audio" for item in case.inputs):
+        limitations.append(
+            "Audio analysis checks what is said, not who is speaking; cloned or synthetic voices are not detected."
+        )
+    if any((item.audio_meta or {}).get("translated") for item in case.inputs):
+        limitations.append("Speech was translated to English by the speech model, so wording may differ from the original.")
+    if ai_investigation is not None:
+        investigation_payload = {**ai_investigation.__dict__, "advisory": True, "escalated": ai_escalated}
+        if ai_escalated:
+            limitations.append(
+                "The AI investigator judged this deceptive, so the verdict was raised from genuine to "
+                "needs_review as a precaution. The AI can only make verdicts more cautious."
+            )
+        elif ai_investigation.verdict != verdict:
+            limitations.append(
+                f"The AI investigator suggested '{ai_investigation.verdict}' but the "
+                f"evidence-based verdict is '{verdict}'; the investigator is advisory only."
+            )
+    else:
+        investigation_payload = (
+            {**ai_investigation_error, "advisory": True} if ai_investigation_error else None
+        )
     return CaseAnalysisContract(
         case_id=case.case_id,
         status=ProcessingStatus.COMPLETED,
@@ -311,4 +277,13 @@ def analyze_case(
         content_assessment=content_assessment,
         deception_risk=deception_risk,
         intent_assessment="not_determinable_from_content",
+        risk_breakdown=fusion.contributions,
+        explanation=build_explanation(
+            signals=signals,
+            claims=claims,
+            evidence=evidence,
+            cross_findings=cross_findings,
+            trusted_domain=trusted_domain and verdict == "genuine",
+            ai_escalated=ai_escalated,
+        ),
     )

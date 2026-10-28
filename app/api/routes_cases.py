@@ -11,6 +11,7 @@ from app.schemas.cases import (
     CaseResponse,
 )
 from app.schemas.common import CaseAnalysisContract
+from app.services.audio import get_transcriber
 from app.services.case_analysis import analyze_case
 from app.api.routes_text import get_pipeline
 from app.services.case_store import (
@@ -56,7 +57,17 @@ def analyze_manual_case(case_id: str) -> CaseAnalysisContract:
                 status_code=422,
                 detail="case must contain at least one input.",
             )
-        result = analyze_case(case, text_analyzer=get_pipeline().analyze)
+        if any(item.transcription_status == "processing" for item in case.inputs):
+            raise HTTPException(
+                status_code=409,
+                detail="Audio is still being transcribed; try again in a moment.",
+            )
+        pipeline = get_pipeline()
+        result = analyze_case(
+            case,
+            text_analyzer=pipeline.analyze,
+            nli_model=getattr(pipeline, "nli_model", None),
+        )
         case_store.set_status(case_id, "completed")
         return result
     except KeyError as error:
@@ -137,8 +148,9 @@ async def add_audio_input(
             transcript=transcript,
         )
         case = case_store.add_input(case_id, item)
+        case_store.set_status(case_id, "processing")
         case.status = "processing"
-        background_tasks.add_task(_complete_audio_case, case_id, bool(item.text))
+        background_tasks.add_task(_process_audio, case_id, item.input_id, content)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="case not found.") from error
     except ValueError as error:
@@ -146,13 +158,19 @@ async def add_audio_input(
     return _case_response(case)
 
 
-def _complete_audio_case(case_id: str, has_transcript: bool) -> None:
+def _process_audio(case_id: str, input_id: str, content: bytes) -> None:
+    """Transcribe an uploaded voice note in the background (or accept the supplied transcript)."""
     try:
-        case = case_store.get(case_id)
-        case.status = "completed" if has_transcript else "failed"
-        case_store.set_status(case_id, case.status)
-    except KeyError:
+        item = next(i for i in case_store.get(case_id).inputs if i.input_id == input_id)
+        if item.text:  # the user supplied a transcript
+            case_store.set_audio_result(case_id, input_id, text=item.text, metadata=item.audio_meta)
+            return
+        transcript = get_transcriber().transcribe(content)
+        case_store.set_audio_result(case_id, input_id, text=transcript.text, metadata=transcript.metadata())
+    except (KeyError, StopIteration):
         return
+    except (ValueError, RuntimeError) as error:
+        case_store.set_audio_result(case_id, input_id, text=None, error=str(error))
 
 
 def _case_response(case) -> CaseResponse:

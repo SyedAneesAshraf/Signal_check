@@ -28,6 +28,9 @@ class CaseInputResponse(BaseModel):
     file_name: str | None = None
     mime_type: str | None = None
     size_bytes: int | None = None
+    transcription_status: str | None = None
+    transcription_error: str | None = None
+    audio_meta: dict | None = None
 
 
 class CaseResponse(CreateCaseResponse):

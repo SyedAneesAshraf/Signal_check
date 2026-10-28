@@ -1,12 +1,9 @@
 """URL extraction and pretrained image OCR for multimodal claim analysis."""
 
 from html.parser import HTMLParser
-from io import BytesIO
-import re
 from urllib.parse import urlparse
 
 import httpx
-from PIL import Image
 
 
 class _ArticleTextParser(HTMLParser):
@@ -77,56 +74,10 @@ def fetch_url_text(url: str, *, timeout: float = 20.0, max_chars: int = 50_000) 
 
 
 def extract_image_text(image_bytes: bytes) -> str:
-    """Extract printed text with the pretrained TrOCR model."""
-    if not image_bytes:
-        raise ValueError("image must not be empty.")
-    try:
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
-    except Exception as error:
-        raise ValueError("The uploaded file is not a valid image.") from error
+    """Extract all readable text from an image or screenshot with RapidOCR."""
+    from app.services.ocr import read_image
 
-    try:
-        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-
-        processor = _get_trocr_processor(TrOCRProcessor, VisionEncoderDecoderModel)
-        model = _get_trocr_model(VisionEncoderDecoderModel)
-        pixel_values = processor(images=image, return_tensors="pt").pixel_values
-        generated_ids = model.generate(pixel_values, max_new_tokens=128)
-        text = _clean_ocr_text(
-            processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-        )
-    except (ImportError, OSError, RuntimeError) as error:
-        raise RuntimeError(
-            "Image OCR is unavailable. The pretrained TrOCR model could not be loaded."
-        ) from error
-    if len(text) < 3:
+    text = read_image(image_bytes).text
+    if len(text.strip()) < 3:
         raise ValueError("No readable claim text was found in the image.")
     return text
-
-
-def _clean_ocr_text(text: str) -> str:
-    """Remove common TrOCR punctuation artifacts without rewriting the claim."""
-    cleaned = " ".join(text.split()).strip()
-    cleaned = re.sub(r"\s+([,.;!?])", r"\1", cleaned)
-    return re.sub(r"\s+[@#]\s*\d+%?\s*$", "", cleaned).strip()
-
-
-_trocr_processor = None
-_trocr_model = None
-
-
-def _get_trocr_processor(processor_type, model_type):
-    global _trocr_processor
-    if _trocr_processor is None:
-        _trocr_processor = processor_type.from_pretrained(
-            "microsoft/trocr-base-printed"
-        )
-    return _trocr_processor
-
-
-def _get_trocr_model(model_type):
-    global _trocr_model
-    if _trocr_model is None:
-        _trocr_model = model_type.from_pretrained("microsoft/trocr-base-printed")
-        _trocr_model.eval()
-    return _trocr_model

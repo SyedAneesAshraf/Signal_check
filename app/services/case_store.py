@@ -1,6 +1,6 @@
 """Temporary in-process storage for manually submitted verification cases."""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from threading import Lock
@@ -22,6 +22,9 @@ class CaseInput:
     mime_type: str | None = None
     size_bytes: int | None = None
     raw_content: bytes | None = field(default=None, repr=False, compare=False)
+    transcription_status: str | None = None  # supplied | processing | completed | failed (audio only)
+    transcription_error: str | None = None
+    audio_meta: dict | None = None
 
 
 @dataclass
@@ -70,6 +73,35 @@ class CaseStore:
                 raise KeyError(case_id)
             case.inputs.append(item)
             return _copy_case(case)
+
+    def set_audio_result(
+        self,
+        case_id: str,
+        input_id: str,
+        *,
+        text: str | None,
+        metadata: dict | None = None,
+        error: str | None = None,
+    ) -> None:
+        """Record the outcome of transcribing one audio input and update the case status."""
+        with self._lock:
+            case = self._cases.get(case_id)
+            if case is None:
+                raise KeyError(case_id)
+            for index, item in enumerate(case.inputs):
+                if item.input_id == input_id:
+                    case.inputs[index] = replace(
+                        item,
+                        text=text or None,
+                        transcription_status="failed" if error else "completed",
+                        transcription_error=error,
+                        audio_meta=metadata,
+                    )
+                    break
+            else:
+                raise KeyError(input_id)
+            pending = any(item.transcription_status == "processing" for item in case.inputs)
+            case.status = "processing" if pending else "collecting_inputs"
 
     def set_status(self, case_id: str, status: str) -> None:
         with self._lock:
@@ -144,6 +176,8 @@ def build_audio_input(
         mime_type=mime_type,
         size_bytes=len(content),
         raw_content=content,
+        transcription_status="supplied" if transcript and transcript.strip() else "processing",
+        audio_meta={"source": "supplied"} if transcript and transcript.strip() else None,
     )
 
 

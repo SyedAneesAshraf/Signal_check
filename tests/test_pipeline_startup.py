@@ -11,7 +11,7 @@ class StubNLI:
 
 
 def test_live_pipeline_does_not_load_local_embedding_index(monkeypatch) -> None:
-    monkeypatch.setattr(verifier, "BartNLIModel", lambda: StubNLI())
+    monkeypatch.setattr(verifier, "BartNLIModel", lambda *args, **kwargs: StubNLI())
 
     class StubLiveProvider:
         def __init__(self) -> None:
